@@ -1,0 +1,5 @@
+streamlit>=1.36
+transformers>=4.40
+torch
+Pillow
+numpy
