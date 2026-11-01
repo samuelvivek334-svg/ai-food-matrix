@@ -1,193 +1,414 @@
+
 import os
-import io
-import json
-from typing import Optional
+from pathlib import Path
 
+import pandas as pd
+import requests
 import streamlit as st
+import torch
 from PIL import Image
-import numpy as np
+from transformers import CLIPModel, CLIPProcessor
 
-try:
-    from transformers import pipeline
-except Exception:
-    pipeline = None
+st.set_page_config(page_title="AI Food Matrix", page_icon="🥗", layout="wide")
 
-st.set_page_config(page_title="AI Food Matrix | Indian Diet Bio-Predictor", page_icon="🍛", layout="wide")
+MODEL_ID = "openai/clip-vit-base-patch32"
+DATA_FILE = Path("data/food_reference.csv")
+USER_AGENT = "AIFoodMatrix/1.0 (educational research prototype)"
 
-CUSTOM_CSS = """
-<style>
-.main {background: #fffaf4;}
-.block-container {padding-top: 1.6rem; max-width: 1180px;}
-.hero {padding: 1.5rem 1.7rem; border-radius: 22px; background: linear-gradient(120deg,#2e251f,#6e3e24); color: white; margin-bottom: 1rem;}
-.hero h1 {color:white; margin:0; font-size:2.1rem;}
-.hero p {color:#f9e9d8; font-size:1rem; margin:.5rem 0 0;}
-.metric-card {padding:1rem; border:1px solid #ead9c8; border-radius:16px; background:white;}
-.small-note {font-size:.88rem; color:#6b625c;}
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
-st.markdown("""
-<div class="hero">
-  <h1>🍛 AI Food Matrix</h1>
-  <p>Indian Diet Bio-Predictor · Upload a food photo, identify the likely dish, and explore nutrition estimates.</p>
-</div>
-""", unsafe_allow_html=True)
-
-st.warning(
-    "Research prototype: a photo cannot reliably reveal exact ingredients, portion weight, recipe, or glycemic index. "
-    "Nutrition values are rough estimates. This app does not measure blood glucose or provide medical advice."
-)
-
-@st.cache_resource(show_spinner="Loading image recognition model (first run may take a few minutes)...")
-def load_classifier():
-    if pipeline is None:
-        raise RuntimeError("Transformers is not installed. Install requirements.txt and restart the app.")
-    # General-purpose zero-shot image classifier; candidate labels include common Indian dishes.
-    return pipeline(
-        task="zero-shot-image-classification",
-        model="openai/clip-vit-base-patch32"
-    )
-
-# Approximate nutrition references per 100 g of prepared food. Values are illustrative,
-# broad estimates for UI demonstration—not a validated nutrient database or measured GI labels.
-# Must be replaced with source-verified recipe data before research/public use.
-FOOD_DATA = {
-    "idli": {"kcal": 146, "carbs": 29.0, "protein": 4.5, "fat": 1.0, "fiber": 2.0, "gi": None, "note": "Varies by rice:urad ratio, fermentation, size and recipe."},
-    "dosa": {"kcal": 184, "carbs": 27.0, "protein": 4.5, "fat": 6.0, "fiber": 1.5, "gi": None, "note": "Varies by batter, oil, thickness and fillings."},
-    "plain rice": {"kcal": 130, "carbs": 28.0, "protein": 2.7, "fat": 0.3, "fiber": 0.4, "gi": None, "note": "Varies substantially by rice variety and cooking."},
-    "chapati": {"kcal": 297, "carbs": 50.0, "protein": 9.0, "fat": 7.0, "fiber": 7.0, "gi": None, "note": "Values depend on flour, oil/ghee and thickness."},
-    "poha": {"kcal": 180, "carbs": 30.0, "protein": 3.5, "fat": 5.0, "fiber": 2.0, "gi": None, "note": "Varies with rice flakes, peanuts, vegetables and portion."},
-    "upma": {"kcal": 150, "carbs": 24.0, "protein": 4.0, "fat": 4.0, "fiber": 2.0, "gi": None, "note": "Varies by semolina, oil and vegetables."},
-    "pongal": {"kcal": 165, "carbs": 25.0, "protein": 4.5, "fat": 5.0, "fiber": 2.0, "gi": None, "note": "Varies by rice/dal ratio and ghee."},
-    "biryani": {"kcal": 180, "carbs": 24.0, "protein": 7.0, "fat": 6.0, "fiber": 1.5, "gi": None, "note": "Large recipe variation; meat/vegetables/oil and rice type matter."},
-    "dal": {"kcal": 116, "carbs": 20.0, "protein": 7.5, "fat": 1.5, "fiber": 7.0, "gi": None, "note": "Depends on lentil type, thickness and added oil."},
-    "sambar": {"kcal": 65, "carbs": 9.0, "protein": 3.0, "fat": 2.0, "fiber": 3.0, "gi": None, "note": "Varies with dal, vegetables and recipe."},
-    "paneer curry": {"kcal": 190, "carbs": 8.0, "protein": 10.0, "fat": 14.0, "fiber": 2.0, "gi": None, "note": "Varies with paneer quantity, gravy, cream and oil."},
-    "chicken curry": {"kcal": 160, "carbs": 5.0, "protein": 17.0, "fat": 8.0, "fiber": 1.0, "gi": None, "note": "Varies by cut, gravy, skin and oil."},
-    "chole": {"kcal": 165, "carbs": 22.0, "protein": 8.0, "fat": 5.0, "fiber": 7.0, "gi": None, "note": "Varies by chickpea amount, gravy and added oil."},
-    "samosa": {"kcal": 300, "carbs": 32.0, "protein": 5.0, "fat": 17.0, "fiber": 3.0, "gi": None, "note": "Varies by size, filling and frying oil."},
-    "vada": {"kcal": 280, "carbs": 28.0, "protein": 8.0, "fat": 15.0, "fiber": 4.0, "gi": None, "note": "Varies by dal type, size and absorbed oil."},
-    "parotta": {"kcal": 320, "carbs": 47.0, "protein": 7.0, "fat": 11.0, "fiber": 2.0, "gi": None, "note": "Varies by flour, layered fat and serving size."},
-    "curd rice": {"kcal": 130, "carbs": 20.0, "protein": 4.0, "fat": 3.0, "fiber": 0.5, "gi": None, "note": "Varies by rice-to-curd ratio, tempering and additions."},
-    "vegetable curry": {"kcal": 90, "carbs": 10.0, "protein": 3.0, "fat": 4.0, "fiber": 4.0, "gi": None, "note": "Depends on vegetables and oil."},
-    "salad": {"kcal": 35, "carbs": 7.0, "protein": 2.0, "fat": 0.5, "fiber": 3.0, "gi": None, "note": "Depends on ingredients and dressing."},
-    "banana": {"kcal": 89, "carbs": 23.0, "protein": 1.1, "fat": 0.3, "fiber": 2.6, "gi": None, "note": "Ripeness and variety affect carbohydrate and response."},
-    "apple": {"kcal": 52, "carbs": 14.0, "protein": 0.3, "fat": 0.2, "fiber": 2.4, "gi": None, "note": "Variety and serving size matter."},
-    "unknown": {"kcal": None, "carbs": None, "protein": None, "fat": None, "fiber": None, "gi": None, "note": "No suitable nutrition reference selected."}
-}
-
-LABELS = [
-    "idli", "dosa", "plain rice", "chapati", "poha", "upma", "pongal", "biryani",
-    "dal", "sambar", "paneer curry", "chicken curry", "chole", "samosa", "vada",
-    "parotta", "curd rice", "vegetable curry", "salad", "banana", "apple",
-    "fried rice", "noodles", "pizza", "burger", "sandwich", "other food"
+FOOD_LABELS = [
+    "pizza", "hamburger", "sandwich", "salad", "soup",
+    "fried rice", "noodles", "pasta", "grilled chicken",
+    "chicken curry", "chicken biryani", "vegetable biryani",
+    "plain cooked rice", "dal lentil curry", "chickpea curry",
+    "paneer curry", "idli", "dosa", "masala dosa", "uttapam",
+    "sambar", "pongal", "curd rice", "chapati roti", "parotta",
+    "poori", "vada", "samosa", "pav bhaji", "vegetable curry",
+    "fish curry", "grilled fish", "omelette", "boiled eggs",
+    "fruit salad", "cake", "ice cream", "bread", "oatmeal",
+    "stir fried vegetables", "fried chicken", "vegetable noodles",
+    "hakka noodles", "egg fried rice", "chicken 65",
+    "vegetable manchurian", "mushroom manchurian",
 ]
 
-def classify_image(image: Image.Image):
-    clf = load_classifier()
-    candidates = [f"a photo of {label}" for label in LABELS]
-    out = clf(image, candidate_labels=candidates)
-    cleaned = []
-    for item in out[:5]:
-        label = item["label"].replace("a photo of ", "").strip().lower()
-        cleaned.append((label, float(item["score"])))
-    return cleaned
+NUTRIENT_IDS = {
+    "Energy (kcal)": 1008,
+    "Protein (g)": 1003,
+    "Carbohydrate (g)": 1005,
+    "Fat (g)": 1004,
+    "Fibre (g)": 1079,
+}
 
-def map_to_food(label: str):
-    label = label.lower()
-    for key in FOOD_DATA:
-        if key != "unknown" and key in label:
-            return key
-    # A few broad aliases
-    aliases = {
-        "fried rice": "plain rice",
-        "rice": "plain rice",
-        "noodles": "unknown",
-        "other food": "unknown",
-        "burger": "unknown",
-        "pizza": "unknown",
-        "sandwich": "unknown"
-    }
-    for token, key in aliases.items():
-        if token in label:
-            return key
-    return "unknown"
 
-def fmt(x, suffix=""):
-    return "Not available" if x is None else f"{x:g}{suffix}"
+@st.cache_resource(show_spinner="Loading image model...")
+def load_model(offline: bool):
+    processor = CLIPProcessor.from_pretrained(
+        MODEL_ID, local_files_only=offline
+    )
+    model = CLIPModel.from_pretrained(
+        MODEL_ID, local_files_only=offline
+    )
+    model.eval()
+    return processor, model
 
-uploaded_file = st.file_uploader("Upload a clear photo of one food item or dish", type=["jpg","jpeg","png","webp"])
-if uploaded_file:
+
+def identify_food(image, offline):
+    processor, model = load_model(offline)
+    prompts = [f"a photo of {food}" for food in FOOD_LABELS]
+    inputs = processor(
+        text=prompts, images=image, return_tensors="pt", padding=True
+    )
+    with torch.no_grad():
+        outputs = model(**inputs)
+        scores = outputs.logits_per_image.softmax(dim=1)[0]
+    top = torch.argsort(scores, descending=True)[:5].tolist()
+    return [(FOOD_LABELS[i], float(scores[i])) for i in top]
+
+
+def search_usda(food_name, api_key):
+    """Search USDA FoodData Central. Requires a private API key."""
+    if not api_key:
+        return None
+
+    url = "https://api.nal.usda.gov/fdc/v1/foods/search"
     try:
-        image = Image.open(uploaded_file).convert("RGB")
-        col_img, col_result = st.columns([1, 1.2], gap="large")
-        with col_img:
-            st.image(image, caption="Uploaded food photo", use_container_width=True)
-        with st.spinner("Recognizing likely food... first use downloads the vision model."):
-            predictions = classify_image(image)
-        best_label, confidence = predictions[0]
-        mapped = map_to_food(best_label)
-
-        with col_result:
-            st.subheader("AI image recognition")
-            st.metric("Likely dish", best_label.title(), f"Model score: {confidence:.1%}")
-            st.caption("Scores are model similarities, not calibrated probabilities.")
-            st.write("Other possible matches:")
-            for label, score in predictions[1:4]:
-                st.write(f"• {label.title()} — {score:.1%}")
-
-        st.divider()
-        st.subheader("Confirm the food before estimating nutrition")
-        options = [k for k in FOOD_DATA.keys() if k != "unknown"]
-        default_index = options.index(mapped) if mapped in options else 0
-        selected_food = st.selectbox(
-            "Choose the closest matching dish (correct the AI if needed)",
-            options=options,
-            index=default_index,
-            format_func=lambda x: x.title()
+        response = requests.post(
+            url,
+            params={"api_key": api_key},
+            json={"query": food_name, "pageSize": 5},
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
         )
-        portion = st.number_input("Estimated portion eaten (grams)", min_value=1, max_value=2000, value=150, step=10)
-        d = FOOD_DATA[selected_food]
-        st.subheader("Approximate nutrition estimate")
-        st.caption(f"Reference values are rough demonstration estimates per 100 g, scaled to your entered portion. Confirm against a reliable recipe/nutrition source.")
-        a, b, c = st.columns(3)
-        a.metric("Energy", fmt(None if d["kcal"] is None else round(d["kcal"]*portion/100), " kcal"))
-        b.metric("Carbohydrates", fmt(None if d["carbs"] is None else round(d["carbs"]*portion/100, 1), " g"))
-        c.metric("Protein", fmt(None if d["protein"] is None else round(d["protein"]*portion/100, 1), " g"))
-        d1, d2 = st.columns(2)
-        d1.metric("Fat", fmt(None if d["fat"] is None else round(d["fat"]*portion/100, 1), " g"))
-        d2.metric("Fiber", fmt(None if d["fiber"] is None else round(d["fiber"]*portion/100, 1), " g"))
-        st.info(d["note"])
-        st.subheader("Glycemic index / post-meal response")
-        st.write("**GI prediction: Not provided.** A photo classifier plus generic nutrition estimates is not enough to produce a scientifically valid GI value.")
-        st.write("**Personal post-meal glucose curve: Not available.** That requires actual time-stamped glucose measurements and other data.")
-        st.download_button(
-            "Download this result as JSON",
-            data=json.dumps({
-                "recognized_label": best_label,
-                "recognition_score_not_probability": confidence,
-                "selected_food": selected_food,
-                "portion_g": portion,
-                "approximate_nutrition_scaled_from_demo_reference_per_100g": {
-                    "energy_kcal": None if d["kcal"] is None else round(d["kcal"]*portion/100,1),
-                    "carbs_g": None if d["carbs"] is None else round(d["carbs"]*portion/100,1),
-                    "protein_g": None if d["protein"] is None else round(d["protein"]*portion/100,1),
-                    "fat_g": None if d["fat"] is None else round(d["fat"]*portion/100,1),
-                    "fiber_g": None if d["fiber"] is None else round(d["fiber"]*portion/100,1)
-                },
-                "gi": None,
-                "limitations": d["note"]
-            }, indent=2),
-            file_name="food_analysis.json",
-            mime="application/json"
+        response.raise_for_status()
+        foods = response.json().get("foods", [])
+    except (requests.RequestException, ValueError):
+        return None
+
+    if not foods:
+        return None
+
+    # Show the best search match for user review; it is not guaranteed
+    # to represent the exact recipe or cooking method.
+    food = foods[0]
+    values = {}
+    for item in food.get("foodNutrients", []):
+        nutrient_id = item.get("nutrientId")
+        for label, wanted_id in NUTRIENT_IDS.items():
+            if nutrient_id == wanted_id:
+                values[label] = item.get("value")
+
+    return {
+        "food_name": food.get("description", food_name),
+        "source": "USDA FoodData Central",
+        "source_url": (
+            "https://fdc.nal.usda.gov/food-details/"
+            + str(food.get("fdcId", ""))
+            + "/nutrients"
+        ),
+        "data_type": food.get("dataType", "Not specified"),
+        "values": values,
+        "basis": "USDA search result; confirm the food and nutrient basis.",
+    }
+
+
+def lookup_off_barcode(barcode):
+    """Look up packaged food by barcode in Open Food Facts."""
+    if not barcode.strip():
+        return None
+
+    url = (
+        "https://world.openfoodfacts.org/api/v3/product/"
+        + requests.utils.quote(barcode.strip(), safe="")
+        + ".json"
+    )
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
         )
-    except Exception as e:
-        st.error("The image model could not run. Check internet access and requirements, then restart the app.")
-        st.exception(e)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    product = data.get("product")
+    if data.get("status") != 1 or not product:
+        return None
+
+    nutriments = product.get("nutriments", {})
+    mapping = {
+        "Energy (kcal)": "energy-kcal_100g",
+        "Protein (g)": "proteins_100g",
+        "Carbohydrate (g)": "carbohydrates_100g",
+        "Fat (g)": "fat_100g",
+        "Fibre (g)": "fiber_100g",
+    }
+    values = {
+        label: nutriments[key]
+        for label, key in mapping.items()
+        if nutriments.get(key) is not None
+    }
+
+    return {
+        "food_name": product.get("product_name", "Packaged food"),
+        "source": "Open Food Facts",
+        "source_url": (
+            "https://world.openfoodfacts.org/product/"
+            + barcode.strip()
+        ),
+        "data_type": "Community-submitted packaged-food label",
+        "values": values,
+        "basis": "Reported per 100 g on the product record.",
+    }
+
+
+def lookup_local(food_name):
+    """Use a locally saved CSV table when internet data is unavailable."""
+    if not DATA_FILE.exists():
+        return None
+
+    try:
+        df = pd.read_csv(DATA_FILE)
+    except (OSError, pd.errors.ParserError, UnicodeDecodeError):
+        return None
+
+    if "food_name" not in df.columns or df.empty:
+        return None
+
+    match = df[
+        df["food_name"].astype(str).str.casefold()
+        == food_name.casefold()
+    ]
+    if match.empty:
+        # Fallback: simple partial match, still show as a candidate.
+        match = df[
+            df["food_name"].astype(str).str.contains(
+                food_name, case=False, regex=False, na=False
+            )
+        ]
+    if match.empty:
+        return None
+
+    row = match.iloc[0]
+    columns = {
+        "Energy (kcal)": "energy_kcal",
+        "Protein (g)": "protein_g",
+        "Carbohydrate (g)": "carbohydrate_g",
+        "Fat (g)": "fat_g",
+        "Fibre (g)": "fiber_g",
+    }
+    values = {
+        label: row[column]
+        for label, column in columns.items()
+        if column in df.columns and pd.notna(row.get(column))
+    }
+
+    return {
+        "food_name": str(row["food_name"]),
+        "source": str(row.get("source", "Local CSV; source unspecified")),
+        "source_url": str(row.get("source_url", "")),
+        "data_type": "Saved local reference",
+        "values": values,
+        "basis": "Check the CSV for the stated units and per-100-g basis.",
+    }
+
+
+def display_result(result, portion_g):
+    st.subheader("Nutrition reference")
+    st.write("**Matched record:**", result["food_name"])
+    st.write("**Source:**", result["source"])
+    st.write("**Record type:**", result["data_type"])
+    st.write("**Basis:**", result["basis"])
+
+    if result.get("source_url"):
+        st.markdown(f"[Open source record]({result['source_url']})")
+
+    if not result["values"]:
+        st.warning("No usable nutrient values were returned for this record.")
+        return
+
+    st.caption(
+        "Values below are scaled only if the source values are per 100 g. "
+        "Verify the source basis before using the numbers."
+    )
+
+    per_100g = result["values"]
+    scaled = {}
+    for label, value in per_100g.items():
+        try:
+            scaled[label] = float(value) * portion_g / 100
+        except (TypeError, ValueError):
+            continue
+
+    cols = st.columns(min(len(scaled), 5) or 1)
+    for i, (label, value) in enumerate(scaled.items()):
+        cols[i % len(cols)].metric(label, f"{value:.1f}")
+
+    st.warning(
+        "These values describe the matched database record, not measurements "
+        "made from your photo. If the food or serving differs, the result "
+        "may not match what you ate."
+    )
+
+
+st.title("🥗 AI Food Matrix")
+st.subheader("Live camera + image upload + online/offline food references")
+
+st.info(
+    "Educational research prototype. AI recognition is a suggestion, not proof. "
+    "Exact ingredients, serving weight, recipe, GI and personal blood-glucose "
+    "response cannot be determined reliably from a photo alone."
+)
+
+with st.sidebar:
+    st.header("Mode")
+    offline = st.toggle(
+        "Offline mode",
+        value=False,
+        help="Requires model weights already downloaded and a local CSV reference."
+    )
+    st.caption(
+        "For first-time setup, connect to the internet and run the model once "
+        "before enabling offline mode."
+    )
+
+    st.header("USDA lookup")
+    st.caption("Optional. Enter a USDA API key in Streamlit Secrets.")
+    try:
+        usda_key = st.secrets.get("USDA_API_KEY", "")
+    except Exception:
+        usda_key = os.getenv("USDA_API_KEY", "")
+
+    st.markdown("[Get a USDA API key](https://fdc.nal.usda.gov/api-key-signup/)")
+
+    st.header("Image source")
+    source_mode = st.radio(
+        "Choose photo input",
+        ["Take a photo", "Upload a photo"],
+    )
+
+uploaded_image = None
+if source_mode == "Take a photo":
+    uploaded_image = st.camera_input("Take a food photo")
 else:
-    st.markdown("### How it works")
-    st.markdown("1. Upload a food image.  2. The vision model suggests likely dish names.  3. Confirm the dish and portion.  4. Review a rough nutrition estimate.")
-    st.markdown("### Current supported examples")
-    st.write("Idli, dosa, plain rice, chapati, poha, upma, pongal, biryani, dal, sambar, paneer curry, chicken curry, chole, samosa, vada, parotta, curd rice, vegetable curry, salad, banana and apple.")
-    st.caption("For academic use: replace the illustrative nutrient table with a cited dataset and validate it before reporting scientific conclusions.")
+    uploaded_image = st.file_uploader(
+        "Choose a food image",
+        type=["jpg", "jpeg", "png", "webp"],
+    )
+
+barcode = st.text_input(
+    "Optional: packaged food barcode",
+    help="Enter the numbers printed below the barcode. This looks up a packaged product, not a cooked meal."
+)
+
+if uploaded_image is not None:
+    try:
+        image = Image.open(uploaded_image).convert("RGB")
+    except Exception:
+        st.error("Unable to read this image. Please try another JPG, PNG or WEBP file.")
+        st.stop()
+
+    st.image(image, caption="Selected food image", use_container_width=True)
+
+    if st.button("Identify food", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Analysing photo..."):
+                matches = identify_food(image, offline)
+            st.session_state["food_matches"] = matches
+        except Exception as exc:
+            st.error(
+                "Could not load or run the AI model. In offline mode, ensure "
+                "the model was downloaded previously. Check the app logs for details."
+            )
+            st.caption(f"Technical detail: {type(exc).__name__}: {exc}")
+
+matches = st.session_state.get("food_matches")
+if matches:
+    st.subheader("Possible food matches")
+    st.caption(
+        "Scores are relative across the model's candidate labels, not calibrated "
+        "probabilities. Similar-looking foods may be confused."
+    )
+
+    st.dataframe(
+        pd.DataFrame([
+            {"Candidate": name, "Relative score": f"{score * 100:.1f}%"}
+            for name, score in matches
+        ]),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    default_name = matches[0][0]
+    selected_food = st.selectbox(
+        "Confirm or correct the food",
+        FOOD_LABELS,
+        index=FOOD_LABELS.index(default_name),
+    )
+    portion_g = st.number_input(
+        "Portion weight in grams",
+        min_value=1,
+        max_value=3000,
+        value=250,
+        step=10,
+    )
+
+    if st.button("Find nutrition reference", use_container_width=True):
+        result = None
+
+        if barcode.strip():
+            if offline:
+                st.info("Barcode lookup needs internet; trying the local food table instead.")
+            else:
+                with st.spinner("Looking up packaged food..."):
+                    result = lookup_off_barcode(barcode)
+
+        if result is None and not offline and usda_key:
+            with st.spinner("Searching USDA FoodData Central..."):
+                result = search_usda(selected_food, usda_key)
+
+        if result is None:
+            result = lookup_local(selected_food)
+
+        st.session_state["nutrition_result"] = result
+        st.session_state["portion_g"] = portion_g
+        st.session_state["selected_food"] = selected_food
+
+    result = st.session_state.get("nutrition_result")
+    if result:
+        display_result(result, st.session_state.get("portion_g", 250))
+
+        export = {
+            "selected_food": st.session_state.get("selected_food", ""),
+            "portion_g_entered": st.session_state.get("portion_g", 250),
+            "reference_food": result["food_name"],
+            "source": result["source"],
+            "source_url": result.get("source_url", ""),
+            "data_type": result["data_type"],
+            "basis": result["basis"],
+            "GI": "Not predicted from photo",
+        }
+        for key, value in result["values"].items():
+            export[key + " source value"] = value
+
+        st.download_button(
+            "Download analysis summary",
+            data=pd.DataFrame([export]).to_csv(index=False).encode("utf-8"),
+            file_name="ai_food_matrix_result.csv",
+            mime="text/csv",
+        )
+    elif st.session_state.get("selected_food"):
+        st.warning(
+            "No matching online or local nutrient record was found. "
+            "Do not substitute an invented value. Try a more specific food name "
+            "or add a verified record to data/food_reference.csv."
+        )
+
+st.markdown("---")
+st.subheader("What this version does not claim")
+st.write(
+    "- It does not calculate a scientifically validated GI from the image.\n"
+    "- It does not estimate exact food weight from pixels.\n"
+    "- It does not treat AI similarity scores as calibrated confidence.\n"
+    "- It does not replace nutrition assessment or medical advice."
+)
