@@ -4,3 +4,4 @@ torch>=2.2
 Pillow>=10
 pandas>=2.0
 requests>=2.31
+zxing-cpp>=2.2
