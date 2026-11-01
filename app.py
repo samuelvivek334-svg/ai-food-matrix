@@ -412,3 +412,682 @@ st.write(
     "- It does not treat AI similarity scores as calibrated confidence.\n"
     "- It does not replace nutrition assessment or medical advice."
 )
+
+
+# ============================================================
+# AI FOOD MATRIX - TRACKER, PORTIONS, BARCODE, REPORTS & MEALS
+# ============================================================
+
+NUTRIENT_FIELDS = {
+    "Calories (kcal)": "energy_kcal",
+    "Protein (g)": "protein_g",
+    "Carbohydrates (g)": "carbohydrate_g",
+    "Fat (g)": "fat_g",
+    "Fiber (g)": "fiber_g",
+    "Sugar (g)": "sugar_g",
+    "Saturated fat (g)": "saturated_fat_g",
+    "Sodium (mg)": "sodium_mg",
+}
+
+GOAL_OPTIONS = [
+    "Gym / muscle building",
+    "Weight management",
+    "Diabetes / blood sugar awareness",
+    "General healthy eating",
+]
+
+
+def safe_number(value):
+    try:
+        number = float(value)
+        if pd.isna(number):
+            return 0.0
+        return number
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_off_product(barcode):
+    """Look up a packaged product using the Open Food Facts API."""
+    url = (
+        "https://world.openfoodfacts.org/api/v2/product/"
+        f"{barcode}.json"
+    )
+    headers = {"User-Agent": "AIFoodMatrix/1.0 (nutrition research app)"}
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        if payload.get("status") != 1:
+            return None, "Product not found in Open Food Facts."
+
+        product = payload.get("product", {})
+        nutrients = product.get("nutriments", {})
+
+        def nutrient(*keys):
+            for key in keys:
+                value = nutrients.get(key)
+                if value is not None:
+                    return safe_number(value)
+            return None
+
+        record = {
+            "food_name": (
+                product.get("product_name")
+                or product.get("product_name_en")
+                or f"Product {barcode}"
+            ),
+            "energy_kcal": nutrient("energy-kcal_100g", "energy-kcal_value"),
+            "protein_g": nutrient("proteins_100g"),
+            "carbohydrate_g": nutrient("carbohydrates_100g"),
+            "fat_g": nutrient("fat_100g"),
+            "fiber_g": nutrient("fiber_100g"),
+            "sugar_g": nutrient("sugars_100g"),
+            "saturated_fat_g": nutrient("saturated-fat_100g"),
+            "sodium_mg": (
+                nutrient("sodium_100g") * 1000
+                if nutrient("sodium_100g") is not None
+                else None
+            ),
+            "source": "Open Food Facts",
+            "source_url": (
+                "https://world.openfoodfacts.org/product/"
+                f"{barcode}"
+            ),
+        }
+        return record, None
+
+    except requests.RequestException:
+        return None, "Online lookup failed. Check your internet connection."
+    except (ValueError, TypeError):
+        return None, "The product data could not be read."
+
+
+def barcode_from_image(image):
+    """Decode a barcode from an uploaded image."""
+    try:
+        results = zxingcpp.read_barcodes(image.convert("RGB"))
+        for result in results:
+            if result.text:
+                return result.text
+        return None
+    except Exception:
+        return None
+
+
+def display_food_nutrients(record, grams):
+    """Calculate nutrient amounts from a per-100-g database record."""
+    multiplier = safe_number(grams) / 100.0
+
+    st.caption(
+        f"Calculated for {grams:g} g, using database values per 100 g."
+    )
+
+    cols = st.columns(4)
+    keys = [
+        ("Calories", "energy_kcal", "kcal"),
+        ("Protein", "protein_g", "g"),
+        ("Carbohydrates", "carbohydrate_g", "g"),
+        ("Fat", "fat_g", "g"),
+        ("Fiber", "fiber_g", "g"),
+        ("Sugar", "sugar_g", "g"),
+        ("Saturated fat", "saturated_fat_g", "g"),
+        ("Sodium", "sodium_mg", "mg"),
+    ]
+
+    for index, (label, key, unit) in enumerate(keys):
+        value = record.get(key)
+        if value is None or pd.isna(value):
+            display = "Not available"
+        else:
+            display = f"{safe_number(value) * multiplier:.1f} {unit}"
+        cols[index % 4].metric(label, display)
+
+
+# Keep food logs in this Streamlit session.
+if "food_log" not in st.session_state:
+    st.session_state["food_log"] = []
+
+if "nutrition_records" not in st.session_state:
+    st.session_state["nutrition_records"] = {}
+
+
+st.markdown("---")
+st.header("🎯 Your nutrition goal")
+
+selected_goal = st.selectbox(
+    "Choose your goal",
+    GOAL_OPTIONS,
+    key="nutrition_goal",
+)
+
+if selected_goal == "Gym / muscle building":
+    st.info(
+        "Focus on adequate energy, protein, balanced carbohydrates, "
+        "healthy fats, and resistance training. Individual protein needs vary."
+    )
+elif selected_goal == "Weight management":
+    st.info(
+        "Track portions and overall intake. Sustainable changes are generally "
+        "more useful than extreme calorie restriction."
+    )
+elif selected_goal == "Diabetes / blood sugar awareness":
+    st.info(
+        "Pay attention to total carbohydrates, serving size, fiber, and "
+        "added sugars when available. Follow your healthcare professional's "
+        "individual advice."
+    )
+else:
+    st.info(
+        "Aim for a varied diet with vegetables, fruits, protein sources, "
+        "whole grains, and suitable portions."
+    )
+
+
+# ---------------- ONLINE BARCODE LOOKUP ----------------
+
+st.markdown("---")
+st.header("📦 Packaged-food barcode lookup")
+
+barcode_image = st.file_uploader(
+    "Upload a clear photo of the barcode",
+    type=["png", "jpg", "jpeg", "webp"],
+    key="barcode_image",
+)
+
+if barcode_image is not None:
+    try:
+        barcode_picture = Image.open(barcode_image).convert("RGB")
+        st.image(
+            barcode_picture,
+            caption="Uploaded barcode",
+            width=300,
+        )
+        if st.button("Read barcode image"):
+            detected_barcode = barcode_from_image(barcode_picture)
+            if detected_barcode:
+                st.session_state["detected_barcode"] = detected_barcode
+                st.success(f"Barcode detected: {detected_barcode}")
+            else:
+                st.warning(
+                    "No barcode detected. Try a sharper, well-lit image "
+                    "with the entire barcode visible."
+                )
+    except Exception:
+        st.error("The uploaded image could not be opened.")
+
+barcode_value = st.text_input(
+    "Or enter the barcode number",
+    value=st.session_state.get("detected_barcode", ""),
+    key="barcode_number",
+)
+
+if st.button("Search packaged food online"):
+    if not barcode_value.strip().isdigit():
+        st.warning("Enter a valid numeric barcode.")
+    else:
+        with st.spinner("Looking up the packaged food..."):
+            product_record, product_error = get_off_product(
+                barcode_value.strip()
+            )
+
+        if product_record:
+            st.session_state["barcode_result"] = product_record
+            st.success("Product found.")
+        else:
+            st.session_state.pop("barcode_result", None)
+            st.warning(product_error)
+
+barcode_record = st.session_state.get("barcode_result")
+
+if barcode_record:
+    st.subheader(str(barcode_record["food_name"]))
+    st.write("Source: Open Food Facts")
+    st.write("Nutrient figures are reported per 100 g when available.")
+
+    product_grams = st.number_input(
+        "Amount eaten (g)",
+        min_value=1.0,
+        max_value=5000.0,
+        value=100.0,
+        step=10.0,
+        key="barcode_portion",
+    )
+    display_food_nutrients(barcode_record, product_grams)
+
+    if st.button("Add packaged food to today's log"):
+        st.session_state["food_log"].append({
+            "date": date.today().isoformat(),
+            "meal": "Packaged food",
+            "food_name": barcode_record["food_name"],
+            "grams": product_grams,
+            **{
+                key: (
+                    safe_number(barcode_record[key]) * product_grams / 100
+                    if barcode_record.get(key) is not None
+                    else None
+                )
+                for key in NUTRIENT_FIELDS.values()
+            },
+            "source": "Open Food Facts",
+        })
+        st.success("Added to this session's food log.")
+
+
+# ---------------- PORTION CALCULATOR ----------------
+
+st.markdown("---")
+st.header("⚖️ Portion-size calculator")
+
+local_records = load_local_food_data()
+available_foods = []
+
+if not local_records.empty and "food_name" in local_records.columns:
+    available_foods.extend(
+        local_records["food_name"].dropna().astype(str).tolist()
+    )
+
+available_foods.extend(
+    list(st.session_state["nutrition_records"].keys())
+)
+
+if not available_foods:
+    st.caption(
+        "No local nutrition records are available yet. Search for a food "
+        "online below, or use the barcode lookup above."
+    )
+else:
+    portion_food = st.selectbox(
+        "Select a saved food",
+        sorted(set(available_foods)),
+        key="portion_food",
+    )
+    portion_grams = st.number_input(
+        "Portion size in grams",
+        min_value=1.0,
+        max_value=5000.0,
+        value=150.0,
+        step=10.0,
+        key="portion_grams",
+    )
+
+    local_record = local_nutrition(portion_food)
+    portion_record = (
+        st.session_state["nutrition_records"].get(portion_food)
+        or local_record
+    )
+
+    if portion_record:
+        display_food_nutrients(portion_record, portion_grams)
+
+        if st.button("Add portion to daily log"):
+            st.session_state["food_log"].append({
+                "date": date.today().isoformat(),
+                "meal": "Meal",
+                "food_name": portion_food,
+                "grams": portion_grams,
+                **{
+                    key: (
+                        safe_number(portion_record[key])
+                        * portion_grams / 100
+                        if portion_record.get(key) is not None
+                        else None
+                    )
+                    for key in NUTRIENT_FIELDS.values()
+                },
+                "source": portion_record.get("source", "Local database"),
+            })
+            st.success("Portion added to your log.")
+
+
+# ---------------- ONLINE FOOD SEARCH FOR ALL NUTRIENTS ----------------
+
+st.markdown("---")
+st.header("🔎 Find nutrition online")
+
+online_food_query = st.text_input(
+    "Search a food name",
+    placeholder="e.g. cooked lentils, apple, chicken breast",
+    key="extended_food_search",
+)
+
+if st.button("Look up food nutrition"):
+    if not online_food_query.strip():
+        st.warning("Enter a food name.")
+    else:
+        with st.spinner("Searching the online nutrition database..."):
+            online_record, online_error = online_nutrition(
+                online_food_query.strip()
+            )
+
+        if online_record:
+            # USDA records may have fewer nutrients than packaged-food data.
+            online_record.setdefault("sugar_g", None)
+            online_record.setdefault("saturated_fat_g", None)
+            online_record.setdefault("sodium_mg", None)
+
+            # Store only in session memory until the user saves/logs it.
+            st.session_state["nutrition_records"][
+                online_food_query.strip()
+            ] = online_record
+            st.session_state["latest_online_record"] = online_record
+            st.success("Nutrition record retrieved.")
+        else:
+            st.warning(
+                online_error or "No nutrition record was returned."
+            )
+
+latest_record = st.session_state.get("latest_online_record")
+
+if latest_record:
+    st.write("**Matched database record:**", latest_record.get("food_name"))
+    st.write("**Source:**", latest_record.get("source", "USDA FoodData Central"))
+
+    online_grams = st.number_input(
+        "Portion to calculate (g)",
+        min_value=1.0,
+        max_value=5000.0,
+        value=100.0,
+        step=10.0,
+        key="online_portion_grams",
+    )
+    display_food_nutrients(latest_record, online_grams)
+
+    if st.button("Add online food to daily log"):
+        st.session_state["food_log"].append({
+            "date": date.today().isoformat(),
+            "meal": "Meal",
+            "food_name": latest_record.get("food_name", online_food_query),
+            "grams": online_grams,
+            **{
+                key: (
+                    safe_number(latest_record[key]) * online_grams / 100
+                    if latest_record.get(key) is not None
+                    else None
+                )
+                for key in NUTRIENT_FIELDS.values()
+            },
+            "source": latest_record.get("source", "Online database"),
+        })
+        st.success("Food added to your daily log.")
+
+
+# ---------------- HIGH-PROTEIN FOOD FINDER ----------------
+
+st.markdown("---")
+st.header("💪 High-protein food finder")
+
+protein_threshold = st.slider(
+    "Minimum protein per 100 g",
+    min_value=1,
+    max_value=30,
+    value=10,
+)
+
+protein_foods = []
+
+if not local_records.empty:
+    for _, row in local_records.iterrows():
+        protein = row.get("protein_g")
+        if pd.notna(protein) and safe_number(protein) >= protein_threshold:
+            protein_foods.append({
+                "Food": row.get("food_name", "Unknown"),
+                "Protein (g/100 g)": safe_number(protein),
+                "Calories (kcal/100 g)": row.get("energy_kcal"),
+                "Source": row.get("source", "Local database"),
+            })
+
+for food_name, record in st.session_state["nutrition_records"].items():
+    protein = record.get("protein_g")
+    if protein is not None and safe_number(protein) >= protein_threshold:
+        protein_foods.append({
+            "Food": record.get("food_name", food_name),
+            "Protein (g/100 g)": safe_number(protein),
+            "Calories (kcal/100 g)": record.get("energy_kcal"),
+            "Source": record.get("source", "Online database"),
+        })
+
+if protein_foods:
+    protein_table = pd.DataFrame(protein_foods).drop_duplicates(subset=["Food"])
+    protein_table = protein_table.sort_values(
+        "Protein (g/100 g)", ascending=False
+    )
+    st.dataframe(protein_table, use_container_width=True)
+else:
+    st.info(
+        "Search foods online or add verified local nutrition records to build "
+        "your high-protein list. The finder does not invent missing values."
+    )
+
+
+# ---------------- DAILY FOOD LOG ----------------
+
+st.markdown("---")
+st.header("📅 Daily nutrition tracker")
+
+meal_type = st.selectbox(
+    "Meal category for the next manual log",
+    ["Breakfast", "Lunch", "Dinner", "Snack"],
+    key="manual_meal_type",
+)
+
+with st.expander("Add a food manually using a known nutrition record"):
+    manual_name = st.text_input("Food name", key="manual_food_name")
+    manual_grams = st.number_input(
+        "Amount eaten (g)",
+        min_value=1.0,
+        max_value=5000.0,
+        value=100.0,
+        step=10.0,
+        key="manual_food_grams",
+    )
+    manual_calories = st.number_input(
+        "Calories for your portion (kcal)",
+        min_value=0.0,
+        max_value=20000.0,
+        value=0.0,
+        key="manual_calories",
+    )
+    manual_protein = st.number_input(
+        "Protein for your portion (g)",
+        min_value=0.0,
+        max_value=1000.0,
+        value=0.0,
+        key="manual_protein",
+    )
+    manual_carbs = st.number_input(
+        "Carbohydrates for your portion (g)",
+        min_value=0.0,
+        max_value=2000.0,
+        value=0.0,
+        key="manual_carbs",
+    )
+    manual_fat = st.number_input(
+        "Fat for your portion (g)",
+        min_value=0.0,
+        max_value=1000.0,
+        value=0.0,
+        key="manual_fat",
+    )
+    manual_fiber = st.number_input(
+        "Fiber for your portion (g)",
+        min_value=0.0,
+        max_value=1000.0,
+        value=0.0,
+        key="manual_fiber",
+    )
+    manual_sugar = st.number_input(
+        "Sugar for your portion (g)",
+        min_value=0.0,
+        max_value=1000.0,
+        value=0.0,
+        key="manual_sugar",
+    )
+
+    if st.button("Add manual entry"):
+        if not manual_name.strip():
+            st.warning("Enter a food name.")
+        else:
+            st.session_state["food_log"].append({
+                "date": date.today().isoformat(),
+                "meal": meal_type,
+                "food_name": manual_name.strip(),
+                "grams": manual_grams,
+                "energy_kcal": manual_calories,
+                "protein_g": manual_protein,
+                "carbohydrate_g": manual_carbs,
+                "fat_g": manual_fat,
+                "fiber_g": manual_fiber,
+                "sugar_g": manual_sugar,
+                "saturated_fat_g": None,
+                "sodium_mg": None,
+                "source": "User-entered values",
+            })
+            st.success("Entry added.")
+
+if st.session_state["food_log"]:
+    logs = pd.DataFrame(st.session_state["food_log"])
+    logs["date"] = logs["date"].astype(str)
+
+    today_logs = logs[logs["date"] == date.today().isoformat()]
+    st.subheader("Today's foods")
+
+    if not today_logs.empty:
+        st.dataframe(today_logs, use_container_width=True)
+
+        today_totals = today_logs[
+            ["energy_kcal", "protein_g", "carbohydrate_g",
+             "fat_g", "fiber_g", "sugar_g"]
+        ].sum(numeric_only=True)
+
+        metric_columns = st.columns(3)
+        for col, (label, key) in zip(
+            metric_columns,
+            [
+                ("Calories (kcal)", "energy_kcal"),
+                ("Protein (g)", "protein_g"),
+                ("Carbohydrates (g)", "carbohydrate_g"),
+            ],
+        ):
+            col.metric(label, f"{today_totals.get(key, 0):.1f}")
+
+        metric_columns_2 = st.columns(3)
+        for col, (label, key) in zip(
+            metric_columns_2,
+            [
+                ("Fat (g)", "fat_g"),
+                ("Fiber (g)", "fiber_g"),
+                ("Sugar (g)", "sugar_g"),
+            ],
+        ):
+            col.metric(label, f"{today_totals.get(key, 0):.1f}")
+
+    st.download_button(
+        "Download all food logs as CSV",
+        data=logs.to_csv(index=False).encode("utf-8"),
+        file_name="ai_food_matrix_food_log.csv",
+        mime="text/csv",
+    )
+
+    if st.button("Clear all session food logs"):
+        st.session_state["food_log"] = []
+        st.rerun()
+else:
+    st.info("No meals logged in this session yet.")
+
+
+# ---------------- WEEKLY REPORT ----------------
+
+st.markdown("---")
+st.header("📈 Weekly progress report")
+
+if st.session_state["food_log"]:
+    logs = pd.DataFrame(st.session_state["food_log"])
+    logs["date"] = pd.to_datetime(logs["date"], errors="coerce")
+
+    week_start = date.today() - timedelta(days=6)
+    weekly = logs[
+        (logs["date"].dt.date >= week_start)
+        & (logs["date"].dt.date <= date.today())
+    ].copy()
+
+    if weekly.empty:
+        st.info("No meals have been logged in the last seven days.")
+    else:
+        numeric_columns = [
+            "energy_kcal", "protein_g", "carbohydrate_g",
+            "fat_g", "fiber_g", "sugar_g",
+        ]
+        for column in numeric_columns:
+            if column not in weekly.columns:
+                weekly[column] = 0.0
+
+        weekly[numeric_columns] = weekly[numeric_columns].apply(
+            pd.to_numeric, errors="coerce"
+        ).fillna(0)
+
+        daily = weekly.groupby(weekly["date"].dt.date)[numeric_columns].sum()
+        st.write("Daily totals for the last seven days")
+        st.dataframe(daily, use_container_width=True)
+
+        st.line_chart(daily[["energy_kcal", "protein_g"]])
+
+        st.caption(
+            "Reports include only logged foods. Missing nutrient values are "
+            "not proof of zero intake. Download your logs to keep a copy."
+        )
+else:
+    st.info("Log some meals first to generate a weekly report.")
+
+
+# ---------------- MEAL SUGGESTIONS ----------------
+
+st.markdown("---")
+st.header("🍽️ Meal ideas for your goal")
+
+meal_ideas = {
+    "Gym / muscle building": [
+        "Eggs with whole-grain toast and fruit",
+        "Dal, rice, vegetables, and curd",
+        "Paneer or tofu with chapati and vegetables",
+        "Chicken or fish with rice and vegetables",
+        "Yogurt with oats and nuts",
+    ],
+    "Weight management": [
+        "Vegetable omelette with fruit",
+        "Dal with vegetables and a suitable rice portion",
+        "Grilled tofu, paneer, chicken, or fish with vegetables",
+        "Bean salad with whole grains",
+        "Plain yogurt with fruit",
+    ],
+    "Diabetes / blood sugar awareness": [
+        "Eggs or tofu with non-starchy vegetables",
+        "Dal with vegetables and a suitable portion of whole grains",
+        "Unsweetened yogurt with nuts, if appropriate",
+        "Fish, chicken, or tofu with vegetables",
+        "Beans with salad and a measured grain portion",
+    ],
+    "General healthy eating": [
+        "Oats with fruit and unsweetened yogurt",
+        "Idli with sambar",
+        "Rice, dal, and a variety of vegetables",
+        "Chapati with beans or paneer and vegetables",
+        "Fruit with nuts or plain yogurt",
+    ],
+}
+
+st.write(f"Suggestions for: **{selected_goal}**")
+for idea in meal_ideas[selected_goal]:
+    st.markdown(f"- {idea}")
+
+st.caption(
+    "These are general meal ideas, not personalized medical prescriptions. "
+    "Adjust for allergies, dietary preferences, medications, and individual "
+    "health needs. For diabetes, follow your care team's guidance."
+)
