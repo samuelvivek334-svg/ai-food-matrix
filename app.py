@@ -9,6 +9,10 @@ import torch
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
+from datetime import date, timedelta
+import zxingcpp
+
+
 st.set_page_config(page_title="AI Food Matrix", page_icon="🥗", layout="wide")
 
 MODEL_ID = "openai/clip-vit-base-patch32"
@@ -512,7 +516,7 @@ def get_off_product(barcode):
 def barcode_from_image(image):
     """Decode a barcode from an uploaded image."""
     try:
-        results = zxingcpp.read_barcodes(image.convert("RGB"))
+       results = zxingcpp.read_barcodes(np.array(image.convert("RGB")))
         for result in results:
             if result.text:
                 return result.text
