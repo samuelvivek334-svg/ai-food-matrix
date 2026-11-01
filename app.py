@@ -513,16 +513,18 @@ def get_off_product(barcode):
         return None, "The product data could not be read."
 
 
+
 def barcode_from_image(image):
     """Decode a barcode from an uploaded image."""
     try:
-       results = zxingcpp.read_barcodes(np.array(image.convert("RGB")))
+        results = zxingcpp.read_barcodes(np.array(image.convert("RGB")))
         for result in results:
             if result.text:
                 return result.text
         return None
     except Exception:
         return None
+
 
 
 def display_food_nutrients(record, grams):
