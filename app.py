@@ -691,8 +691,14 @@ if barcode_record:
 st.markdown("---")
 st.header("⚖️ Portion-size calculator")
 
-local_records = load_local_food_data()
-available_foods = []
+
+def load_local_food_data():
+    if not DATA_FILE.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(DATA_FILE)
+    except (OSError, ValueError, pd.errors.ParserError):
+        return pd.DataFrame()
 
 if not local_records.empty and "food_name" in local_records.columns:
     available_foods.extend(
